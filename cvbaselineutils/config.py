@@ -1,0 +1,5 @@
+
+# General configuration
+CUDA_DEVICE='0'
+STEPS_PER_EPOCH=500
+BATCH_LOG_FREQUENCY=50
