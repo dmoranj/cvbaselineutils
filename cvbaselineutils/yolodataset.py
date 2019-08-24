@@ -29,6 +29,7 @@ class YoloTrainingDataset(Dataset):
         self.label_size = self.S**2 * self.cell_length
         self.transform = transforms.Compose([
             transforms.Resize(YOLO_SIZE),
+            transforms.ColorJitter(brightness=0.5, saturation=0.5),
             transforms.ToTensor()
         ])
 
@@ -60,6 +61,7 @@ class YoloTrainingDataset(Dataset):
             grid_x, grid_y, anchor_id = np.unravel_index(np.argmax(iou_scores), iou_scores.shape)
 
             label_index = ((grid_x * self.S) + grid_y) * self.cell_length + anchor_id * self.anchor_size
+
             labels[label_index] = 1.0
             labels[label_index + 1] = obj['bx']
             labels[label_index + 2] = obj['by']
@@ -113,7 +115,6 @@ def generate_anchor_boxes(dataset, B):
 
 if __name__ == "__main__":
     dataset = PascalVOCOR("/home/dani/Documentos/Proyectos/Doctorado/Datasets/VOC2012/VOCdevkit/VOC2012")
-
     yoloset = YoloTrainingDataset(dataset, 9, 5)
 
     for image, labels in yoloset:
