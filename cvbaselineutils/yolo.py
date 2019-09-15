@@ -4,13 +4,16 @@ from torch.utils.data import DataLoader
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from time import gmtime, strftime
+import torch.nn.functional as F
 
 import cvbaselineutils.config as conf
-from cvdatasetutils.dnnutils import load_pretrained
 from cvdatasetutils.pascalvoc import PascalVOCOR
 
 from cvbaselineutils.yolodataset import YoloTrainingDataset
+
 from mltrainingtools.cmdlogging import section_logger
+from mltrainingtools.dnnutils import load_pretrained, create_lr_policy
+from mltrainingtools.cvutils import IoU
 
 from scipy.special import expit
 
@@ -24,39 +27,16 @@ import matplotlib.patches as patches
 
 
 EPSILON = 1e-9
+GLOBAL_EVALUATIONS_FILE="yolo_eval.csv"
+GLOBAL_STATS_FILE="yolo_perimage_stats.csv"
 
-
-def segment_IoU(x, w, x_h, w_h):
-    if x < x_h:
-        return ordered_IoU(x, w, x_h, w_h)
-    else:
-        return ordered_IoU(x_h, w_h, x, w)
-
-
-def ordered_IoU(x, w, x_h, w_h):
-    if (x_h > x + w) or (x_h + w_h < x):
-        return 0
-    else:
-        return min(x + w, x_h + w_h) - max(x, x_h)
-
-
-def IoU(x, y, h, w, x_h, y_h, h_h, w_h):
-    x_inter = segment_IoU(x, w, x_h, w_h)
-    y_inter = segment_IoU(y, h, y_h, h_h)
-
-    intersection = x_inter * y_inter
-    union = (h * w) + (h_h * w_h) - intersection
-
-    return intersection/union
-
-
-def get_absolute_coordinates(anchor_box_prior, cell_coords, th, tp, tw, tx, ty):
+def get_absolute_coordinates(anchor_box_prior, cell_coords, tw, th, tx, ty, tp):
     p = expit(tp)
     bx = expit(tx) + cell_coords[0]
     by = expit(ty) + cell_coords[1]
     bh = anchor_box_prior[0] * np.exp(th)
     bw = anchor_box_prior[1] * np.exp(tw)
-    return bh, bw, bx, by, p
+    return bw, bh, bx, by, p
 
 
 class Yolo(nn.Module):
@@ -77,11 +57,21 @@ class Yolo(nn.Module):
         self.feature_extractor = feature_extractor
         self.anchor_size = 5
         self.cell_size = self.anchor_size * self.B + self.num_classes
-        self.detection = nn.Linear(self.middle_layer_size, S * S * self.cell_size)
+        self.output_size = S * S * self.cell_size
+
+        detection_layers = [
+            nn.BatchNorm1d(self.middle_layer_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.middle_layer_size, self.output_size),
+            nn.BatchNorm1d(self.output_size),
+            nn.ReLU(inplace=True)
+        ]
+
+        self.detection_net = nn.Sequential(*detection_layers)
 
     def forward(self, x):
         x = self.feature_extractor(x)
-        x = self.detection(x)
+        x = self.detection_net(x)
         return x
 
     def get_input_size(self):
@@ -114,7 +104,7 @@ class Yolo(nn.Module):
         tw = anchor[anchor_box_index + 4].cpu().detach().numpy().item()
         tp = anchor[anchor_box_index].cpu().detach().numpy().item()
 
-        bh, bw, bx, by, p = get_absolute_coordinates(anchor_box_prior, cell_coords, th, tp, tw, tx, ty)
+        bw, bh, bx, by, p = get_absolute_coordinates(anchor_box_prior, cell_coords, tw, th, tx, ty, tp)
 
         return p, bx, by, bh, bw
 
@@ -272,27 +262,20 @@ def save_results(name, output_path, model, epoch_log_history, lr):
     #TODO: Save the list of classes, or they won't be recoverable at runtime
 
 
-def create_lr_policy(milestones):
-    multipliers = [1, 10, 1, 0.1]
+def execute_single_model(name, output_path, dataloaders, S, B, num_classes, anchors, lr=0.0001, lambda_coord=0.5,
+                         lambda_noobj=0.5, epoch_blocks=conf.EPOCH_BLOCKS, num_epochs=conf.NUM_EPOCHS,
+                         model_file=None):
 
-    def policy(epoch):
-        for i, val in enumerate(milestones):
-            if epoch < val and i < len(multipliers):
-                return multipliers[i]
+    if model_file is not None:
+        model = load_model(model_file, S, B, num_classes, anchors)
+    else:
+        model = Yolo(S, B, num_classes, lambda_noobj, lambda_coord, anchors)
 
-        return multipliers[-1]
-
-    return policy
-
-
-def execute_single_model(name, output_path, dataloaders, S, B, num_classes, anchors, lr=0.001, lambda_coord=0.5,
-                         lambda_noobj=0.5, epoch_blocks=conf.EPOCH_BLOCKS, num_epochs=conf.NUM_EPOCHS):
-    model = Yolo(S, B, num_classes, lambda_noobj, lambda_coord, anchors)
     model.cuda()
     model_parameters = model.parameters()
 
     optimizer = optim.SGD(params=model_parameters, lr=lr, momentum=0.9, weight_decay=0.001)
-    scheduler = LambdaLR(optimizer, lr_lambda=create_lr_policy([10, 50, 80]))
+    scheduler = LambdaLR(optimizer, lr_lambda=create_lr_policy([10, 20, 30]))
 
     loss_criterion = model.create_loss_function()
 
@@ -307,7 +290,7 @@ def execute_single_model(name, output_path, dataloaders, S, B, num_classes, anch
                         loss_criterion, device, epoch_loss_history)
 
 
-def execute():
+def execute(model_file=None):
     S = 7
     B = 5
     batch_size = conf.BATCH_SIZE
@@ -315,7 +298,8 @@ def execute():
 
     name = strftime("%Y%m%d%H%M", gmtime())
 
-    execute_single_model(name, conf.DATA_FOLDER, yolo_dataloaders, S, B, len(dataset.classes), yoloset.anchorbs)
+    execute_single_model(name, conf.DATA_FOLDER, yolo_dataloaders, S, B, len(dataset.classes), yoloset.anchorbs,
+                         model_file=model_file)
 
 
 def prepare_datasets(B, S, batch_size):
@@ -387,6 +371,43 @@ def paint_image(evaluation_path, m, type, image, pixel_objects, classes, colorma
     plt.close(fig)
 
 
+def paint_class_map(evaluation_path, m, type, image, detections, classes, width, height, colormap=None):
+    title = "Yolo OR"
+
+    fig = plt.figure(frameon=False)
+    plt.imshow(image)
+    ax = plt.Axes(fig, [0., 0., 1., 0.9])
+    ax.set_axis_off()
+    fig.add_axes(ax)
+    plt.title(title)
+    class_color = plt.get_cmap('prism')
+
+    anchor_width = int(width / np.sqrt(len(detections['classes'])))
+    anchor_height = anchor_width
+
+    for anchor in detections['classes']:
+        color = class_color(anchor['class'])
+        box = patches.Rectangle((anchor['x'] * width, anchor['y'] * height), anchor_width, anchor_height,
+                                linewidth=1, edgecolor='black', facecolor=color, fill=True, alpha=0.30)
+
+        ax.add_patch(box)
+
+        ax.text(anchor['x'] * width + anchor_width/2, anchor['y'] * height + anchor_height/2, classes[anchor['class']],
+                horizontalalignment='center',
+                verticalalignment='center',
+                size='smaller',
+                bbox=None)
+
+    if colormap:
+        ax.imshow(image, cmap=colormap)
+    else:
+        ax.imshow(image)
+
+    ax.set_axis_off()
+    fig.savefig(os.path.join(evaluation_path, "example_{}_{}_classmap.png".format(type, m)), dpi=120)
+    plt.close(fig)
+
+
 def show_image_results(model_name, detections, images, labels, classes):
     evaluation_path = os.path.join(conf.EVALUATIONS_FOLDER, model_name)
     os.makedirs(evaluation_path, exist_ok=True)
@@ -410,18 +431,89 @@ def show_image_results(model_name, detections, images, labels, classes):
         paint_image(evaluation_path, m, "{}_gt".format(current_batch_name),
                     images[m, :, :, :].permute(1, 2, 0).numpy(), boxes_gt, classes)
 
-        # Pain the class map for the image
+        # Paint the class map for the image
+        paint_class_map(evaluation_path, m, "{}_detected".format(current_batch_name),
+                        images[m, :, :, :].permute(1, 2, 0).numpy(), detections[m], classes, w, h)
 
 
-def evaluate_model(candidates, labels):
-    return []
+def get_map_confusion_matrix(detected_objects, true_objects, target_class=None, threshold=0.5):
+    matrix = {
+        'tp': 0,
+        'fp': 0,
+        'fn': 0
+    }
+
+    for detected in detected_objects:
+        for ground_truth in true_objects:
+            if target_class is not None and ground_truth['class'] != target_class:
+                continue
+
+            overlap = IoU(detected['x'], detected['y'], detected['h'], detected['w'],
+                          ground_truth['x'], ground_truth['y'], ground_truth['h'], ground_truth['w'])
+
+            if overlap > threshold:
+                if detected['class'] == ground_truth['class']:
+                    matrix['tp'] += 1
+                else:
+                    matrix['fn'] += 1
+            else:
+                matrix['fp'] += 1
+
+    return matrix
 
 
-def show_evaluations(global_results):
-    return []
+def evaluate_model(detections, ground_truths, target_class=None):
+    stats = {
+        'precision': [],
+        'recall': []
+    }
+
+    for i, detection in enumerate(detections):
+        ground_truth = ground_truths[i]
+
+        confusion_matrix = get_map_confusion_matrix(detection['objects'], ground_truth['objects'], target_class)
+
+        total_positives = confusion_matrix['tp'] + confusion_matrix['fp']
+
+        if total_positives > 0:
+            precision = confusion_matrix['tp'] / total_positives
+        else:
+            precision = 0.0
+
+        real_positives = confusion_matrix['tp'] + confusion_matrix['fn']
+
+        if real_positives > 0:
+            recall = confusion_matrix['tp'] / real_positives
+        else:
+            recall = 0.0
+
+        stats['precision'].append(precision)
+        stats['recall'].append(recall)
+
+    return pd.DataFrame(stats)
 
 
-def extract_object_candidates(model, batch, threshold=0.51, ground_truth=False):
+def save_evaluations(model_name, mAP, per_class_map, global_stats, classes):
+    evaluation_path = os.path.join(conf.EVALUATIONS_FOLDER, GLOBAL_EVALUATIONS_FILE)
+    evaluation_folder = os.path.join(conf.EVALUATIONS_FOLDER, model_name)
+    os.makedirs(evaluation_folder, exist_ok=True)
+    stats_path = os.path.join(evaluation_folder, GLOBAL_EVALUATIONS_FILE)
+
+    data_raw = {("map_" + classes[key]): [value] for key, value in enumerate(per_class_map)}
+    data_raw['map_global'] = [mAP]
+    data_raw['name'] = [model_name]
+
+    df = pd.DataFrame(data_raw)
+
+    if os.path.isfile(evaluation_path):
+        df.to_csv(evaluation_path, header=False, mode='a')
+    else:
+        df.to_csv(evaluation_path, header=True)
+
+    global_stats.to_csv(stats_path, header=True)
+
+
+def extract_object_candidates(model, batch, threshold=0.55, ground_truth=False):
     M, _ = batch.size()
     softmax = lambda x: np.exp(x)/sum(np.exp(x))
 
@@ -452,10 +544,10 @@ def extract_object_candidates(model, batch, threshold=0.51, ground_truth=False):
                 cell_coords, cell_index, class_end, class_init = model.extract_cell_coords(i_x, i_y)
 
                 if ground_truth:
-                    bh, bw, bx, by, p = box[3], box[4], box[1], box[2], box[0]
+                    bw, bh, bx, by, p = box[3], box[4], box[1], box[2], box[0]
                 else:
-                    bh, bw, bx, by, p = get_absolute_coordinates(anchor_box_prior, cell_coords,
-                                                                 box[3], box[0], box[4], box[1], box[2])
+                    bw, bh, bx, by, p = get_absolute_coordinates(anchor_box_prior, cell_coords,
+                                                                 box[3], box[4], box[1], box[2], box[0])
 
                 candidate_obj = dict(p=p, x=bx, y=by, h=bh, w=bw)
 
@@ -482,6 +574,7 @@ def process_candidates(model, batch):
             cell_class = np.argmax(cell['classes'])
 
             for box in cell['boxes']:
+                box['classes'] = cell['classes'] * box['p']
                 box['class'] = cell_class
                 objects.append(box)
 
@@ -500,10 +593,109 @@ def process_candidates(model, batch):
     return examples
 
 
-def evaluate(path, batch_number=1):
+def NMS(objects):
+    cleaned_objects = []
+    objects.sort(reverse=True, key=lambda x: x['p'])
+
+    # While there are still objects
+
+        # Pick the object with most p
+
+        # From the remaining objects, get those that have an IoU greater than a threshold with the selected one
+
+
+    return objects
+
+
+def refine_detections(candidates):
+    for candidate in candidates:
+        candidate['objects'] = NMS(candidate['objects'])
+
+    return candidates
+
+
+def calculate_map(results, recall_points=11):
+    results['IP'] = results.groupby('recall')['precision'].transform('max')
+    results = results.sort_values(by=['IP'], ascending=False)
+
+    precision_recall = []
+
+    for recall_level in np.linspace(0.0, 1.0, recall_points):
+        try:
+            x = results[results['recall'] >= recall_level]['IP']
+            prec = max(x)
+        except:
+            prec = 0.0
+
+        precision_recall.append(prec)
+
+    map = (1/recall_points) * sum(precision_recall)
+
+    return map
+
+
+def calculate_stats(detections, detections_gt, classes):
+    keys = ['p', 'x', 'y', 'w', 'h']
+
+    global_stats = []
+
+    for i, detection in enumerate(detections):
+        stats = {
+            'p': [],
+            'x': [],
+            'y': [],
+            'h': [],
+            'w': [],
+            'gtp': [],
+            'gtx': [],
+            'gty': [],
+            'gth': [],
+            'gtw': [],
+            'classdist_max': [],
+            'classdist_min': [],
+            'classdist_mean': [],
+            'classdist_sd': []
+        }
+
+        gt_detection = detections_gt[i]
+
+        class_histogram = [0] * len(classes)
+        gt_histogram = [0] * len(classes)
+
+        for object in detection['objects']:
+            for key in keys:
+                stats[key].append(object[key])
+
+            class_histogram[object['class']] += 1
+            stats['classdist_max'].append(np.max(object['classes']))
+            stats['classdist_min'].append(np.min(object['classes']))
+            stats['classdist_mean'].append(np.mean(object['classes']))
+            stats['classdist_sd'].append(np.std(object['classes']))
+
+        for gt_object in gt_detection['objects']:
+            for key in keys:
+                stats['gt' + key].append(gt_object[key])
+
+            gt_histogram[gt_object['class']] += 1
+
+        image_stats = {key + "_mean": [np.mean(stats[key])] for key in keys}
+        image_stats.update({key + "_sd": [np.std(stats[key])] for key in keys})
+        image_stats.update({"detected_" + classes[key]: [value] for key, value in enumerate(class_histogram)})
+        image_stats.update({"gtclass_" + classes[key]: [value] for key, value in enumerate(gt_histogram)})
+        image_stats['classdist_max'] = max(stats['classdist_max'])
+        image_stats['classdist_min'] = min(stats['classdist_min'])
+        image_stats['classdist_mean'] = np.mean(stats['classdist_mean'])
+        image_stats['classdist_sd'] = np.mean(stats['classdist_sd'])
+
+        global_stats.append(pd.DataFrame(image_stats))
+
+    return pd.concat(global_stats)
+
+
+def evaluate(path, batch_number=10, batch_images=5):
     S = 7
     B = 5
-    batch_size = 10
+    batch_size = 15
     model_name = (path.split("/")[-1]).split('.')[0]
 
     dataset, yolo_dataloaders, yoloset = prepare_datasets(B, S, batch_size)
@@ -512,6 +704,9 @@ def evaluate(path, batch_number=1):
     model = load_model(path, S, B, num_classes, yoloset.anchorbs)
 
     global_results = []
+    global_stats = []
+    per_class_results = [[]] * num_classes
+
     current_batch = 0
 
     for images, labels in yolo_dataloaders['eval']:
@@ -519,23 +714,34 @@ def evaluate(path, batch_number=1):
 
         candidates = extract_object_candidates(model, results)
         candidates_gt = extract_object_candidates(model, labels, ground_truth=True)
+
         detections = process_candidates(model, candidates)
+        detections = refine_detections(detections)
+
         detections_gt = process_candidates(model, candidates_gt)
 
-        show_image_results(model_name, detections, images, detections_gt, dataset.classes)
+        if current_batch < batch_images:
+            show_image_results(model_name, detections, images, detections_gt, dataset.classes)
 
-        evaluation_results = evaluate_model(candidates, labels)
-
-        global_results.append(evaluation_results)
+        global_results.append(evaluate_model(detections, detections_gt))
+        [per_class_results[class_id].append(evaluate_model(detections, detections_gt, class_id)) for class_id in range(num_classes)]
+        global_stats.append(calculate_stats(detections, detections_gt, dataset.classes))
 
         current_batch += 1
+
+        if current_batch % 10 == 0:
+            print('Evaluating batch {}'.format(current_batch))
 
         if current_batch > batch_number:
             break
 
-    show_evaluations(global_results)
+    global_stats = pd.concat(global_stats)
+    global_results = pd.concat(global_results)
+    per_class_results = [pd.concat(class_results) for class_results in per_class_results]
 
-    
-if __name__== "__main__":
-    evaluate("./data/201908200516.pt")
-    #execute()
+    map = calculate_map(global_results)
+    per_class_map = [calculate_map(class_result) for class_result in per_class_results]
+
+    save_evaluations(model_name, map, per_class_map, global_stats, dataset.classes)
+
+
